@@ -15,14 +15,18 @@ from .language_config import LANGUAGE_CONFIGS
 LanguageLoader = Callable[[], object] | None
 
 
-def _try_load_from_submodule(lang_name: str) -> LanguageLoader:
+def _try_load_from_submodule(lang_name: str, vendor=False) -> LanguageLoader:
     """Try to load language from git submodule Python bindings."""
-    submodule_path = os.path.join("grammars", f"tree-sitter-{lang_name}")
+    if vendor:
+        vendor_path = os.path.join("grammars", "vendor")
+        submodule_path = os.path.join(vendor_path, f"tree-sitter-{lang_name}")
+    else:
+        submodule_path = os.path.join("grammars", f"tree-sitter-{lang_name}")
     python_bindings_path = os.path.join(submodule_path, "bindings", "python")
-
+    logger.debug(f"{submodule_path}:{python_bindings_path}")
     if not os.path.exists(python_bindings_path):
         return None
-
+    logger.debug(f"{submodule_path}:{python_bindings_path}=>exist")
     try:
         # Add the Python bindings to path
         if python_bindings_path not in sys.path:
@@ -87,6 +91,12 @@ def _try_load_from_submodule(lang_name: str) -> LanguageLoader:
 def _import_language_loaders() -> dict[str, LanguageLoader]:
     """Import language loaders with proper error handling and typing."""
     loaders: dict[str, LanguageLoader] = {}
+    try:
+        from tree_sitter_c import language as c_language_so
+        loaders["c"] = c_language_so
+        logger.debug("load existed c lib")
+    except ImportError:
+        loaders["c"] = _try_load_from_submodule("c", True) #use tree-sitter-c from original github
 
     try:
         from tree_sitter_python import language as python_language_so
@@ -174,7 +184,7 @@ def load_parsers() -> tuple[dict[str, Parser], dict[str, Any]]:
 
     # Deepcopy to avoid modifying the original configs
     configs = deepcopy(LANGUAGE_CONFIGS)
-
+    # breakpoint()
     for lang_name, lang_config in configs.items():
         if lang_lib := LANGUAGE_LIBRARIES.get(lang_name):
             try:

@@ -154,7 +154,7 @@ class OllamaProvider(ModelProvider):
 
     def create_model(self, model_id: str, **kwargs: Any) -> OpenAIModel:
         self.validate_config()
-
+        print(f"create_model : endpoint {self.endpoint} model_id: {model_id}")
         provider = PydanticOpenAIProvider(api_key=self.api_key, base_url=self.endpoint)
         return OpenAIModel(model_id, provider=provider, **kwargs)  # type: ignore
 

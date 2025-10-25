@@ -1,0 +1,24 @@
+version: '3'
+services:
+  memgraph:
+    image: memgraph/memgraph-mage
+    ports:
+    - ${MEMGRAPH_PORT:-7687}:7687
+    - ${MEMGRAPH_HTTP_PORT:-7444}:7444
+  lab:
+    image: memgraph/lab
+    ports:
+    - ${LAB_PORT:-3000}:3000
+    environment:
+      QUICK_CONNECT_MG_HOST: memgraph
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    ports:
+    - 6333:6333
+    - 6334:6334
+    environment:
+      QDRANT__SERVICE__API_KEY: changeme
+    volumes:
+    - /home/tom/docker/qdrant_storage:/qdrant/storage
+    restart: unless-stopped

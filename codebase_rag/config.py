@@ -38,6 +38,15 @@ class AppConfig(BaseSettings):
         case_sensitive=False,
     )
 
+    QDRANT_TIMEOUT: int = 60
+    QDRANT_PREFER_GRPC: bool = True
+    QDRANT_RESUME_STATE: str = ".tmp/qdrant_resume.json"
+    QDRANT_BATCH: int = 64
+    QDRANT_MAX_LINES_PER_CHUNK: int = 300
+
+    EMBEDDING_BACKEND: str = "OLLAMA"
+    EMBEDDING_MODEL: str = "bge-m3:latest"
+    EMBEDDING_ENDPOINT: str = "http://192.168.0.225:11434/"
     # Memgraph settings
     MEMGRAPH_HOST: str = "localhost"
     MEMGRAPH_PORT: int = 7687
@@ -68,7 +77,7 @@ class AppConfig(BaseSettings):
     CYPHER_SERVICE_ACCOUNT_FILE: str | None = None
 
     # Fallback endpoint for ollama
-    LOCAL_MODEL_ENDPOINT: AnyHttpUrl = AnyHttpUrl("http://localhost:11434/v1")
+    LOCAL_MODEL_ENDPOINT: AnyHttpUrl = AnyHttpUrl("http://192.168.0.225:11434/v1")
 
     # General settings
     TARGET_REPO_PATH: str = "."

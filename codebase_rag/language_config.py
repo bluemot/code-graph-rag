@@ -79,6 +79,24 @@ class LanguageConfig:
 ################################################################################
 
 LANGUAGE_CONFIGS = {
+    "c": create_lang_config(
+        file_extensions=[".c", ".h"],
+        function_node_types=["function_definition"],
+        class_node_types=["struct_specifier", "union_specifier", "enum_specifier"],
+        module_node_types=[],
+        call_node_types=["call_expression"],
+        import_node_types=["preproc_include"],
+        import_from_node_types=["preproc_include"],
+        function_query="""
+            (function_definition
+               (function_declarator
+                    (identifier) @name) ) @function
+            """,
+        call_query="""
+            (call_expression
+                (identifier) @name ) @call
+            """,
+    ),
     "python": create_lang_config(
         file_extensions=[".py"],
         function_node_types=["function_definition"],

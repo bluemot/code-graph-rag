@@ -9,12 +9,14 @@ from tree_sitter import Node, QueryCursor
 
 from ..language_config import LanguageConfig
 from ..services.graph_service import MemgraphIngestor
+from .c_utils import build_c_qualified_name, extract_c_function_name
 
 # No longer need constants import - using Tree-sitter directly
 from .cpp_utils import convert_operator_symbol_to_name, extract_cpp_function_name
 from .import_processor import ImportProcessor
 from .python_utils import resolve_class_name
 from .type_inference import TypeInferenceEngine
+from .c_callbacks_ts import extract_callbacks_c  # 新增
 
 
 class CallProcessor:
@@ -104,6 +106,204 @@ class CallProcessor:
         self.type_inference = type_inference
         self.class_inheritance = class_inheritance
 
+    def _guess_function_definition_in_repo(self, func_name: str, repo_root: Path) -> tuple[str, int, int] | None:
+        """
+        超輕量：用正規表示式在 repo 裡找第一個像是 'ret foo(...) {'
+        的定義，回傳 (path, start_line, end_line)；找不到就回 None。
+        這是 best-effort,不取代正式的定義擷取 pass。
+        """
+        pat = re.compile(rf"^\s*(?:[a-zA-Z_][\w\s\*]+)?\b{re.escape(func_name)}\s*\(", re.M)
+        for p in repo_root.rglob("*.c"):
+            try:
+                txt = p.read_text(errors="ignore")
+            except Exception:
+                continue
+            m = pat.search(txt)
+            if not m:
+                continue
+            # 粗略行號：只標 start_line，end_line 先不抓或抓到下一個 '}'（可再強化）
+            start_line = txt[:m.start()].count("\n") + 1  # 1-based
+            # 粗抓 end：往後找第一個獨立的 '}'；不可靠但夠用做臨時欄位
+            tail = txt[m.start():]
+            close_idx = tail.find("\n}")
+            end_line = start_line + (tail[:close_idx].count("\n") + 1 if close_idx != -1 else 1)
+            return (str(p), start_line, end_line)
+        return None
+
+
+    def _ingest_c_callbacks(self, file_path: Path, module_qn: str, root_node: Node) -> None:
+        """
+        Use Tree-sitter (already-parsed root_node) to find callback edges in C files,
+        then write DISPATCHES_TO edges into Memgraph.
+        Caller is resolved by locating the function_definition that encloses the line.
+        """
+        try:
+            src = file_path.read_bytes()
+        except Exception:
+            return
+        logger.debug("process c extract_callbacks_c")
+        recs = extract_callbacks_c(root_node, src)
+        if not recs:
+            logger.debug("no callbacks found")
+            return
+    
+        # helpers ---------------------------------------------------------------
+        def _node_contains_line(n: Node, line0: int) -> bool:
+            return isinstance(n, Node) and n.start_point[0] <= line0 <= n.end_point[0]
+    
+        def _find_enclosing_c_function(root: Node, line0: int) -> Node | None:
+            # DFS 尋找涵蓋該行的 function_definition
+            stack = [root]
+            best: Node | None = None
+            while stack:
+                cur = stack.pop()
+                if cur.type == "function_definition" and _node_contains_line(cur, line0):
+                    # 持續往內找，取最內層涵蓋者
+                    best = cur
+                # 照樣把孩子都納入搜尋
+                for ch in cur.children:
+                    # 先做快速剪枝：只將可能包含該行的節點入棧
+                    if isinstance(ch, Node) and _node_contains_line(ch, line0):
+                        stack.append(ch)
+            return best
+    
+        def _resolve_callee_qn(name: str) -> tuple[str, str] | None:
+            # 完全比對
+            qn_same_mod = f"{module_qn}.{name}"
+            if qn_same_mod in self.function_registry:
+                return self.function_registry[qn_same_mod], qn_same_mod
+            # 後綴匹配（最接近者）
+            candidates = self.function_registry.find_ending_with(name) or []
+            if candidates:
+                candidates.sort(key=lambda qn: (0 if qn.startswith(module_qn) else 1, len(qn)))
+                best = candidates[0]
+                return self.function_registry[best], best
+            return None
+        # ----------------------------------------------------------------------
+    
+        # 確保若 fallback 需要用到 Module 節點，圖上有該節點
+        module_path = str(file_path)
+        self.ingestor.ensure_node_batch("Module", {"qualified_name": module_qn, "path": module_path})
+    
+        for kind, field, callee, line in recs:
+            # 1) 解析 callee
+            resolved = _resolve_callee_qn(callee)
+            if not resolved:
+                # 建立 synthetic callee（一定要有 qualified_name，避免被略過）
+                syn_qn = f"{module_qn}.{callee}"
+                self.ingestor.ensure_node_batch("Function", {"qualified_name": syn_qn, "name": callee})
+                callee_key = ("Function", "qualified_name", syn_qn)
+
+                # 嘗試輕量補定義（若猜不到，預設掛在同一個 module 檔上）
+                guess = self._guess_function_definition_in_repo(callee, self.repo_path)
+                logger.debug(f"Found {callee} - {callee_key} guess:{guess}")
+                if guess:
+                    fpath, s, e = guess  # fpath 是實際定義的檔案
+                    self.ingestor.ensure_node_batch("File", {"path": fpath})
+                    self.ingestor.ensure_relationship_batch(
+                        ("Function", "qualified_name", syn_qn),
+                        "DEFINED_IN",
+                        ("File", "path", fpath),
+                        {},
+                    )
+                    # 粗略行號（之後正式 pass 可覆蓋）
+                    self.ingestor.ensure_node_batch(
+                        "Function", {"qualified_name": syn_qn, "start_line": s, "end_line": e}
+                    )
+                else:
+                    # 沒猜到就先掛在 module 所屬檔案，至少讓 (:Function)-[:DEFINED_IN]->(:File) 成立
+                    self.ingestor.ensure_node_batch("File", {"path": module_path})
+                    self.ingestor.ensure_relationship_batch(
+                        ("Function", "qualified_name", syn_qn),
+                        "DEFINED_IN",
+                        ("File", "path", module_path),
+                        {},
+                    )
+            else:
+                callee_type, callee_qn = resolved
+                callee_key = (callee_type, "qualified_name", callee_qn)
+                logger.debug(f"Found {callee_qn} - {callee_key}")
+    
+            # 2) 依行號找 caller function；Tree-sitter 的 row 是 0-based，extract_callbacks_c 回傳 line 多半是 1-based
+            line0 = max(0, int(line) - 1)
+            caller_fn_node = _find_enclosing_c_function(root_node, line0)
+    
+            if caller_fn_node is not None:
+                caller_fn_name = extract_c_function_name(caller_fn_node)
+                if caller_fn_name:
+                    caller_qn = build_c_qualified_name(caller_fn_node, module_qn, caller_fn_name)
+                    # 確保 caller function 節點存在（僅保證唯一鍵，其他屬性可由別處再補）
+                    self.ingestor.ensure_node_batch("Function", {"qualified_name": caller_qn, "name": caller_fn_name})
+                    from_spec = ("Function", "qualified_name", caller_qn)
+                else:
+                    # 找到節點但抓不到名稱，退回 Module
+                    from_spec = ("Module", "qualified_name", module_qn)
+            else:
+                # 在任何 function 之外，視為 module-level 的回呼
+                from_spec = ("Module", "qualified_name", module_qn)
+    
+            # 3) 建立 DISPATCHES_TO 關係（取代 ensure_relationship_batch_by_fileline）
+            self.ingestor.ensure_relationship_batch(
+                from_spec,
+                "DISPATCHES_TO",
+                callee_key,
+                {"field": field, "kind": kind, "api": field, "src": f"{file_path}:{line}"},
+            )
+
+
+
+#    def _ingest_c_callbacks(self, file_path: Path, module_qn: str, root_node: Node) -> None:
+#        """
+#        Use Tree-sitter (already-parsed root_node) to find callback edges in C files,
+#        then write DISPATCHES_TO edges into Memgraph.
+#        """
+#        try:
+#            src = file_path.read_bytes()
+#        except Exception:
+#            return
+#        logger.debug("process c extract_callbacks_c")
+#        recs = extract_callbacks_c(root_node, src )
+#        if not recs:
+#            logger.debug(f"no callbacks found")
+#            return
+#
+#        # 輔助：把 callee 名字盡量解析成 QN；找不到就退回 name-only
+#        def _resolve_callee_qn(name: str) -> tuple[str, str] | None:
+#            # 完全比對
+#            qn_same_mod = f"{module_qn}.{name}"
+#            if qn_same_mod in self.function_registry:
+#                return self.function_registry[qn_same_mod], qn_same_mod
+#            # 後綴匹配（最接近者）
+#            candidates = self.function_registry.find_ending_with(name) or []
+#            if candidates:
+#                candidates.sort(key=lambda qn: (0 if qn.startswith(module_qn) else 1, len(qn)))
+#                best = candidates[0]
+#                return self.function_registry[best], best
+#            return None
+#
+#        for kind, field, callee, line in recs:
+#            resolved = _resolve_callee_qn(callee)
+#            if not resolved:
+#                # 仍寫入，讓圖上至少有名字；由查詢端寬鬆匹配
+#                # 這裡用 name-only node（可選：你也可以跳過）
+#                self.ingestor.ensure_node_batch("Function", {"name": callee})
+#                callee_key = ("Function", "name", callee)
+#                logger.debug(f"Found {callee} - {callee_key}")
+#           else:
+#              callee_type, callee_qn = resolved
+#              callee_key = (callee_type, "qualified_name", callee_qn)
+#              logger.debug(f"Found {callee_qn} - {callee_key}")
+#
+#            # 找 caller：用 file+line 落在 function 範圍來定位
+#            # 這邊沿用你現有 Ingestor 的批次 API；對應到 Cypher 是用 BETWEEN start_line/end_line 的那支
+#            self.ingestor.ensure_relationship_batch_by_fileline(
+#                file_path=str(file_path),
+#                line=line,
+#                rel_type="DISPATCHES_TO",
+#                target_key=callee_key,
+#                rel_props={"field": field, "kind": kind, "api": field, "src": f"{file_path}:{line}"},
+#            )
+
     def process_calls_in_file(
         self, file_path: Path, root_node: Node, language: str, queries: dict[str, Any]
     ) -> None:
@@ -115,15 +315,22 @@ class CallProcessor:
             module_qn = ".".join(
                 [self.project_name] + list(relative_path.with_suffix("").parts)
             )
-            if file_path.name in ("__init__.py", "mod.rs"):
-                # In Python, __init__.py and in Rust, mod.rs represent the parent module directory
+            if file_path.name == "__init__.py":
                 module_qn = ".".join(
                     [self.project_name] + list(relative_path.parent.parts)
                 )
 
             self._process_calls_in_functions(root_node, module_qn, language, queries)
-            self._process_calls_in_classes(root_node, module_qn, language, queries)
-            self._process_module_level_calls(root_node, module_qn, language, queries)
+            #self._process_calls_in_classes(root_node, module_qn, language, queries)
+            logger.debug("c_functions processed")
+            if language == "c":
+                logger.debug("process c callbacks")
+                self._ingest_c_callbacks(file_path, module_qn, root_node)
+            if language != "c":
+                self._process_module_level_calls(
+                    root_node, module_qn, language, queries
+                )
+            # >>> NEW: also ingest C callbacks as DISPATCHES_TO
 
         except Exception as e:
             logger.error(f"Failed to process calls in {file_path}: {e}")
@@ -146,11 +353,18 @@ class CallProcessor:
                 continue
 
             # Extract function name using appropriate method for language
+            func_qn = None
             if language == "cpp":
                 # For C++, use utility functions instead of creating a temporary instance
                 func_name = extract_cpp_function_name(func_node)
                 if not func_name:
                     continue
+            elif language == "c":
+                func_name = extract_c_function_name(func_node)
+                if not func_name:
+                    continue
+                func_qn = build_c_qualified_name(func_node, module_qn, func_name)
+
             else:
                 name_node = func_node.child_by_field_name("name")
                 if not name_node:
@@ -159,11 +373,18 @@ class CallProcessor:
                 if text is None:
                     continue
                 func_name = text.decode("utf8")
-            func_qn = self._build_nested_qualified_name(
-                func_node, module_qn, func_name, lang_config
-            )
+
+            if func_qn is None:
+                func_qn = self._build_nested_qualified_name(
+                    func_node, module_qn, func_name, lang_config
+                )
 
             if func_qn:
+                # 讓 Function 節點至少有 name，圖上更好查
+                try:
+                    self.ingestor.ensure_node_batch("Function", {"qualified_name": func_qn, "name": func_name})
+                except Exception:
+                    pass
                 self._ingest_function_calls(
                     func_node, func_qn, "Function", module_qn, language, queries
                 )
@@ -184,31 +405,14 @@ class CallProcessor:
         for class_node in class_nodes:
             if not isinstance(class_node, Node):
                 continue
-
-            # Rust impl blocks don't have a "name" field, they have a "type" field
-            if language == "rust" and class_node.type == "impl_item":
-                # For Rust impl blocks, get the type being implemented
-                type_node = class_node.child_by_field_name("type")
-                if not type_node:
-                    # Might be a type_identifier child directly
-                    for child in class_node.children:
-                        if child.type == "type_identifier" and child.is_named:
-                            type_node = child
-                            break
-                if not type_node or not type_node.text:
-                    continue
-                class_name = type_node.text.decode("utf8")
-                class_qn = f"{module_qn}.{class_name}"
-            else:
-                # Standard class handling for other languages
-                name_node = class_node.child_by_field_name("name")
-                if not name_node:
-                    continue
-                text = name_node.text
-                if text is None:
-                    continue
-                class_name = text.decode("utf8")
-                class_qn = f"{module_qn}.{class_name}"
+            name_node = class_node.child_by_field_name("name")
+            if not name_node:
+                continue
+            text = name_node.text
+            if text is None:
+                continue
+            class_name = text.decode("utf8")
+            class_qn = f"{module_qn}.{class_name}"
 
             body_node = class_node.child_by_field_name("body")
             if not body_node:
@@ -278,12 +482,6 @@ class CallProcessor:
             # C++: namespace::func() or Class::method() -> qualified_identifier
             elif func_child.type == "qualified_identifier":
                 # Return the full qualified name (e.g., "std::cout")
-                text = func_child.text
-                if text is not None:
-                    return str(text.decode("utf8"))
-            # Rust: Type::method() or module::func() -> scoped_identifier
-            elif func_child.type == "scoped_identifier":
-                # Return the full scoped name (e.g., "Storage::get_instance")
                 text = func_child.text
                 if text is not None:
                     return str(text.decode("utf8"))
@@ -418,10 +616,6 @@ class CallProcessor:
                 f"(resolved as {callee_type}:{callee_qn})"
             )
 
-            # NOTE: We don't call ensure_node_batch here because all Function/Method/Class
-            # nodes are already created in Pass 2 (definition processing) before we reach
-            # Pass 3 (call processing). Re-creating nodes here would overwrite their
-            # properties (decorators, line numbers, docstrings, etc.) with minimal data.
             self.ingestor.ensure_relationship_batch(
                 (caller_type, "qualified_name", caller_qn),
                 "CALLS",
@@ -484,7 +678,6 @@ class CallProcessor:
                         f"      Found nested call from {caller_qn} to {call_name} "
                         f"(resolved as {callee_type}:{callee_qn})"
                     )
-                    # NOTE: We don't call ensure_node_batch here - nodes already exist from Pass 2
                     self.ingestor.ensure_relationship_batch(
                         (caller_type, "qualified_name", caller_qn),
                         "CALLS",
@@ -539,16 +732,9 @@ class CallProcessor:
                     )
                     return self.function_registry[imported_qn], imported_qn
 
-            # 1a.2. Handle qualified calls like "Class.method", "self.attr.method", C++ "Class::method", and Lua "object:method"
-            if "." in call_name or "::" in call_name or ":" in call_name:
-                # Split by '::' for C++, ':' for Lua, or '.' for other languages
-                if "::" in call_name:
-                    separator = "::"
-                elif ":" in call_name:
-                    separator = ":"
-                else:
-                    separator = "."
-                parts = call_name.split(separator)
+            # 1a.2. Handle qualified calls like "Class.method" and "self.attr.method"
+            if "." in call_name:
+                parts = call_name.split(".")
 
                 # Handle JavaScript object method calls like "calculator.add"
                 if len(parts) == 2:
@@ -558,11 +744,8 @@ class CallProcessor:
                     if local_var_types and object_name in local_var_types:
                         var_type = local_var_types[object_name]
 
-                        # Check if var_type is already fully qualified (contains dots)
-                        if "." in var_type:
-                            class_qn = var_type
                         # Resolve var_type to full qualified name
-                        elif var_type in import_map:
+                        if var_type in import_map:
                             class_qn = import_map[var_type]
                         else:
                             class_qn_or_none = self._resolve_class_name(
@@ -571,8 +754,7 @@ class CallProcessor:
                             class_qn = class_qn_or_none if class_qn_or_none else ""
 
                         if class_qn:
-                            # Use the same separator that was used in the call (: for Lua, . for others)
-                            method_qn = f"{class_qn}{separator}{method_name}"
+                            method_qn = f"{class_qn}.{method_name}"
                             if method_qn in self.function_registry:
                                 logger.debug(
                                     f"Type-inferred object method resolved: "
@@ -601,49 +783,7 @@ class CallProcessor:
                                 f"builtin.{var_type}.prototype.{method_name}",
                             )
 
-                    # Fallback 1: Try treating object_name as a class name (for static methods like Storage::getInstance or Storage:getInstance)
-                    if object_name in import_map:
-                        class_qn = import_map[object_name]
-
-                        # For Rust, imports use :: separators (e.g., "controllers::SceneController")
-                        # Convert to project-qualified names (e.g., "rust_proj.src.controllers.SceneController")
-                        if "::" in class_qn:
-                            # Extract last component as class name
-                            rust_parts = class_qn.split("::")
-                            class_name = rust_parts[-1]
-
-                            # Scan registry entries that end with this class name (linear helper)
-                            matching_qns = self.function_registry.find_ending_with(
-                                class_name
-                            )
-                            # Find the first Class entry
-                            for qn in matching_qns:
-                                if self.function_registry.get(qn) == "Class":
-                                    class_qn = qn
-                                    break
-
-                        # For languages like JavaScript/Lua, imports may point to modules
-                        # but the class/table has the same name inside: e.g., storage.Storage -> storage.Storage.Storage
-                        # Check if methods exist with this extended class path
-                        potential_class_qn = f"{class_qn}.{object_name}"
-                        test_method_qn = f"{potential_class_qn}{separator}{method_name}"
-                        if test_method_qn in self.function_registry:
-                            # The extended path works, use it
-                            class_qn = potential_class_qn
-
-                        # Construct method QN using the appropriate separator
-                        # For Lua, use : for both instance and class methods (Lua tables)
-                        # For Rust/C++, use . for registry lookup (even though call uses ::)
-                        # For others, use . for static/class methods
-                        registry_separator = separator if separator == ":" else "."
-                        method_qn = f"{class_qn}{registry_separator}{method_name}"
-                        if method_qn in self.function_registry:
-                            logger.debug(
-                                f"Import-resolved static call: {call_name} -> {method_qn}"
-                            )
-                            return self.function_registry[method_qn], method_qn
-
-                    # Fallback 2: Try to find the method in the same module
+                    # Fallback: Try to find the method in the same module
                     method_qn = f"{module_qn}.{method_name}"
                     if method_qn in self.function_registry:
                         logger.debug(
@@ -660,11 +800,8 @@ class CallProcessor:
                     if local_var_types and attribute_ref in local_var_types:
                         var_type = local_var_types[attribute_ref]
 
-                        # Check if var_type is already fully qualified (contains dots)
-                        if "." in var_type:
-                            class_qn = var_type
                         # Resolve var_type to full qualified name
-                        elif var_type in import_map:
+                        if var_type in import_map:
                             class_qn = import_map[var_type]
                         else:
                             class_qn_or_none = self._resolve_class_name(
@@ -673,7 +810,6 @@ class CallProcessor:
                             class_qn = class_qn_or_none if class_qn_or_none else ""
 
                         if class_qn:
-                            # For self.attribute.method, the method separator is always . (not : or ::)
                             method_qn = f"{class_qn}.{method_name}"
                             if method_qn in self.function_registry:
                                 logger.debug(
@@ -714,11 +850,8 @@ class CallProcessor:
                     if local_var_types and class_name in local_var_types:
                         var_type = local_var_types[class_name]
 
-                        # Check if var_type is already fully qualified (contains dots)
-                        if "." in var_type:
-                            class_qn = var_type
                         # The var_type might be a simple class name, resolve to full qn
-                        elif var_type in import_map:
+                        if var_type in import_map:
                             class_qn = import_map[var_type]
                         else:
                             # Try to find the class in the same module or resolve it
@@ -786,10 +919,7 @@ class CallProcessor:
 
         # 2b. Use the Trie to find any matching symbol
         # This is a fallback and can be imprecise, but better than nothing.
-        # For qualified calls like "Class.method", "Class::method", or "object:method", extract just the method name
-        search_name = re.split(r"[.:]|::", call_name)[-1]
-
-        possible_matches = self.function_registry.find_ending_with(search_name)
+        possible_matches = self.function_registry.find_ending_with(call_name)
         if possible_matches:
             # Sort candidates by likelihood (prioritize closer modules)
             possible_matches.sort(

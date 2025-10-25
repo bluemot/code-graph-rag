@@ -1,3 +1,10 @@
+"""
+Refactored GraphUpdater with modular architecture.
+
+This is the new modular version that maintains all functionality while
+splitting the monolithic class into logical components.
+"""
+
 import sys
 from collections import OrderedDict, defaultdict
 from collections.abc import ItemsView, KeysView
@@ -9,6 +16,7 @@ from tree_sitter import Node, Parser
 
 from .config import IGNORE_PATTERNS
 from .language_config import get_language_config
+from .parsers.c_utils import determine_if_cpp_header
 from .parsers.factory import ProcessorFactory
 from .services.graph_service import MemgraphIngestor
 
@@ -143,39 +151,6 @@ class FunctionRegistryTrie:
         """Find all qualified names ending with the given suffix."""
         return [qn for qn in self._entries.keys() if qn.endswith(f".{suffix}")]
 
-    def find_with_prefix(self, prefix: str) -> list[tuple[str, str]]:
-        """Find all qualified names that start with the given prefix.
-
-        Args:
-            prefix: The prefix to search for (e.g., "module.Class.method")
-
-        Returns:
-            List of (qualified_name, type) tuples matching the prefix
-        """
-        results = []
-        prefix_parts = prefix.split(".")
-
-        # Navigate to prefix in trie
-        current = self.root
-        for part in prefix_parts:
-            if part not in current:
-                return []  # Prefix doesn't exist
-            current = current[part]
-
-        # DFS to find all entries under this prefix
-        def dfs(node: dict[str, Any]) -> None:
-            if "__qn__" in node:
-                qn = node["__qn__"]
-                func_type = node["__type__"]
-                results.append((qn, func_type))
-
-            for key, child in node.items():
-                if not key.startswith("__"):  # Skip metadata keys
-                    dfs(child)
-
-        dfs(current)
-        return results
-
 
 class BoundedASTCache:
     """Memory-aware AST cache with automatic cleanup to prevent memory leaks.
@@ -270,6 +245,8 @@ class GraphUpdater:
         self.simple_name_lookup: dict[str, set[str]] = defaultdict(set)
         self.ast_cache = BoundedASTCache(max_entries=1000, max_memory_mb=500)
         self.ignore_dirs = IGNORE_PATTERNS
+        self.c_folders = []
+        self.cpp_folders = []
 
         # Create processor factory with all dependencies
         self.factory = ProcessorFactory(
@@ -395,9 +372,28 @@ class GraphUpdater:
 
         # Use pathlib.rglob for more efficient file iteration
         for filepath in self.repo_path.rglob("*"):
+            suffix = filepath.suffix
             if filepath.is_file() and not should_skip_path(filepath):
+                if suffix == ".h":
+                    if (
+                        filepath.parent not in self.c_folders
+                        and filepath.parent not in self.cpp_folders
+                    ):
+                        is_cpp_header = False
+                        if "cpp" in self.parsers:
+                            is_cpp_header = determine_if_cpp_header(
+                                filepath, self.parsers["cpp"]
+                            )
+                        if is_cpp_header:
+                            self.cpp_folders.append(filepath.parent)
+                            suffix = ".hpp"
+                        else:
+                            self.c_folders.append(filepath.parent)
+                    elif filepath.parent in self.cpp_folders:
+                        suffix = ".hpp"
+
                 # Check if this file type is supported for parsing
-                lang_config = get_language_config(filepath.suffix)
+                lang_config = get_language_config(suffix)
                 if lang_config and lang_config.name in self.parsers:
                     # Parse as Module and cache AST
                     result = self.factory.definition_processor.process_file(
